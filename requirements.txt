@@ -1,0 +1,7 @@
+langchain>=0.1.0
+langchain-core>=0.1.0
+langchain-openai>=0.0.2
+langchain-community>=0.0.10
+python-dotenv>=1.0.0
+tavily-python>=0.2.8
+Faker==22.6.0 
