@@ -404,6 +404,150 @@ def create_agent() -> AgentExecutor:
 
     return agent_executor
 
+def create_combined_guardrail_chain(current_user: User) -> RunnableSequence:
+    """Create a single chain that combines user verification and SQL safety checks."""
+    llm = ChatOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        model="gpt-3.5-turbo",
+        temperature=0,
+        streaming=True
+    )
+
+    combined_prompt = ChatPromptTemplate.from_messages([
+        SystemMessage(content=f"""You are a security guardrail system that verifies user identity and SQL query safety.
+        Current user: {current_user.first_name} {current_user.last_name} (ID: {current_user.id}, Email: {current_user.username})
+        
+        Your job is to:
+        1. Convert natural language queries into SQL queries that only access the current user's data
+        2. Verify the SQL query for potential injection attacks
+        3. Return a response in EXACTLY this format:
+        authorized: true/false
+        reason: <explanation>
+        sensitive_fields: [field1, field2, ...]
+        sql_query: <SQL query if authorized>
+        safe: true/false
+        sql_reason: <explanation for SQL safety>
+        suggested_query: <safe alternative query if applicable>
+
+        Rules for user authorization:
+        - Users can ONLY access their own data (must include WHERE id = {current_user.id})
+        - Sensitive fields include: ssn, phone_number, address, date_of_birth
+        - Users can see their own: first_name, last_name, email, address, phone_number, date_of_birth
+        - Natural language queries about the user's own data should be converted to SQL
+        - Always err on the side of caution when protecting user data
+        - No queries that could expose other users' data
+        - No queries about finding neighbors or similar users
+
+        Rules for SQL safety:
+        1. Only allow SELECT queries
+        2. No UNION, JOIN, or subqueries that could expose other users' data
+        3. No string concatenation or dynamic SQL
+        4. No OR conditions that could bypass WHERE clauses
+        5. No LIKE patterns that could match multiple users
+        6. No functions that could be used maliciously (e.g., substr, instr)
+        7. Must include proper WHERE clause restrictions
+        8. No attempts to access system tables or metadata
+        9. No attempts to modify data (INSERT, UPDATE, DELETE)
+        10. No attempts to create or drop tables
+
+        Examples of natural language to SQL conversion:
+        - "What's my address?" -> "SELECT address FROM users WHERE id = {current_user.id}"
+        - "Where do I live?" -> "SELECT address FROM users WHERE id = {current_user.id}"
+        - "What's my phone number?" -> "SELECT phone_number FROM users WHERE id = {current_user.id}"
+        
+        Example denied queries:
+        - "What's Steven's address?" (trying to access another user's data)
+        - "Show me all users" (no user restriction)
+        - "What's my SSN?" (sensitive data)
+        - "Find users who live near me" (could expose other users' data)
+
+        Example response for "What's my address?":
+        authorized: true
+        reason: User is requesting their own address
+        sensitive_fields: []
+        sql_query: SELECT address FROM users WHERE id = {current_user.id}
+        safe: true
+        sql_reason: Query is properly restricted to a single user
+        suggested_query: null
+
+        Example response for "Find users who live near me":
+        authorized: false
+        reason: Query could expose other users' data
+        sensitive_fields: []
+        sql_query: null
+        safe: false
+        sql_reason: Query not generated due to authorization failure
+        suggested_query: null"""),
+        ("human", "Query: {query}")
+    ])
+
+    def parse_combined_response(response: str) -> Dict[str, Any]:
+        """Parse the combined guardrail response into a structured format."""
+        try:
+            # Debug print
+            print("\nCombined Guardrail Response:")
+            print(response)
+            print("---")
+
+            # Initialize default values
+            result = {
+                "authorized": False,
+                "reason": "Invalid response format",
+                "sensitive_fields": [],
+                "sql_query": None,
+                "safe": False,
+                "sql_reason": "Invalid response format",
+                "suggested_query": None
+            }
+
+            # Parse each line
+            for line in response.split('\n'):
+                line = line.strip().lower()
+                if not line:
+                    continue
+                
+                if line.startswith('authorized:'):
+                    result["authorized"] = 'true' in line
+                elif line.startswith('reason:'):
+                    result["reason"] = line.replace('reason:', '').strip()
+                elif line.startswith('sensitive_fields:'):
+                    fields_str = line.replace('sensitive_fields:', '').strip()
+                    if fields_str and fields_str != '[]':
+                        result["sensitive_fields"] = [f.strip() for f in fields_str.strip('[]').split(',')]
+                elif line.startswith('sql_query:'):
+                    query = line.replace('sql_query:', '').strip()
+                    if query and query.lower() != 'null':
+                        result["sql_query"] = query
+                elif line.startswith('safe:'):
+                    result["safe"] = 'true' in line
+                elif line.startswith('sql_reason:'):
+                    result["sql_reason"] = line.replace('sql_reason:', '').strip()
+                elif line.startswith('suggested_query:'):
+                    query = line.replace('suggested_query:', '').strip()
+                    if query and query.lower() != 'null':
+                        result["suggested_query"] = query
+
+            return result
+        except Exception as e:
+            print(f"Error parsing combined response: {e}")
+            return {
+                "authorized": False,
+                "reason": f"Error parsing response: {str(e)}",
+                "sensitive_fields": [],
+                "sql_query": None,
+                "safe": False,
+                "sql_reason": f"Error parsing response: {str(e)}",
+                "suggested_query": None
+            }
+
+    return (
+        {"query": RunnablePassthrough()}
+        | combined_prompt
+        | llm
+        | StrOutputParser()
+        | parse_combined_response
+    )
+
 def main():
     # Get a random user for this session
     current_user = get_random_user()
@@ -411,10 +555,9 @@ def main():
         print("Error: Could not get a user from the database. Please ensure the database is populated.")
         return
 
-    # Create the agent and guardrail chains
+    # Create the agent and combined guardrail chain
     agent_executor = create_agent()
-    guardrail_chain = create_guardrail_chain(current_user)
-    sql_verification_chain = create_sql_verification_chain()
+    combined_guardrail_chain = create_combined_guardrail_chain(current_user)
     
     # Initialize chat history as a list of messages
     chat_history: List[Tuple[HumanMessage, AIMessage]] = []
@@ -433,8 +576,8 @@ def main():
             break
             
         try:
-            # First, run the guardrail check
-            guardrail_result = guardrail_chain.invoke(user_input)
+            # Run the combined guardrail check
+            guardrail_result = combined_guardrail_chain.invoke(user_input)
             
             if not guardrail_result["authorized"]:
                 print(f"\nAccess Denied: {guardrail_result['reason']}")
@@ -442,22 +585,16 @@ def main():
                     print(f"Sensitive fields detected: {', '.join(guardrail_result['sensitive_fields'])}")
                 continue
             
-            # If authorized and we have a SQL query, verify it
+            # If authorized and we have a SQL query, check if it's safe
             if guardrail_result["sql_query"]:
-                # Replace the user ID placeholder with the actual ID
-                sql_query = guardrail_result["sql_query"].format(current_user=current_user)
-                
-                # Verify the SQL query
-                verification_result = sql_verification_chain.invoke(sql_query)
-                
-                if not verification_result["safe"]:
-                    print(f"\nSQL Query Blocked: {verification_result['reason']}")
-                    if verification_result["suggested_query"]:
-                        print(f"Suggested safe query: {verification_result['suggested_query']}")
+                if not guardrail_result["safe"]:
+                    print(f"\nSQL Query Blocked: {guardrail_result['sql_reason']}")
+                    if guardrail_result["suggested_query"]:
+                        print(f"Suggested safe query: {guardrail_result['suggested_query']}")
                     continue
                 
                 # If the query is safe, execute it
-                response = query_database.invoke(sql_query)
+                response = query_database.invoke(guardrail_result["sql_query"])
                 print(f"\nAI: {response}")
                 continue
             

@@ -80,18 +80,6 @@ def query_database(query: str) -> str:
     except Exception as e:
         return f"Error executing query: {str(e)}"
 
-@tool
-def get_weather(location: str) -> str:
-    """Get the current weather in a given location."""
-    # This is a mock implementation - in a real app, you'd call a weather API
-    return f"The weather in {location} is sunny and 72°F"
-
-@tool
-def search_web(query: str) -> str:
-    """Search the web for information about a topic."""
-    # This is a mock implementation - in a real app, you'd use a search API
-    return f"Here are some search results about {query}"
-
 def create_agent() -> AgentExecutor:
     # Initialize the language model
     llm = ChatOpenAI(
@@ -102,7 +90,7 @@ def create_agent() -> AgentExecutor:
     )
 
     # Define the tools
-    tools = [query_database, get_weather, search_web]
+    tools = [query_database]
 
     # Create the prompt template with database context
     system_message = """You are a helpful AI assistant with access to a SQLite database containing user information.

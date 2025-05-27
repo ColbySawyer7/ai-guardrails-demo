@@ -234,20 +234,8 @@ def query_database(query: str) -> str:
     except Exception as e:
         return f"Error executing query: {str(e)}"
 
-# Define some example tools
-@tool
-def get_weather(location: str) -> str:
-    """Get the current weather in a given location."""
-    # This is a mock implementation - in a real app, you'd call a weather API
-    return f"The weather in {location} is sunny and 72°F"
-
-@tool
-def search_web(query: str) -> str:
-    """Search the web for information about a topic."""
-    # This is a mock implementation - in a real app, you'd use a search API
-    return f"Here are some search results about {query}"
-
-def create_agent() -> AgentExecutor:
+def create_protected_agent(current_user: User) -> RunnableSequence:
+    """Create a chain that combines the guardrail with the agent for protected database access."""
     # Initialize the language model
     llm = ChatOpenAI(
         base_url="https://openrouter.ai/api/v1",
@@ -256,8 +244,11 @@ def create_agent() -> AgentExecutor:
         streaming=True
     )
 
+    # Create the guardrail chain
+    guardrail_chain = create_guardrail_chain(current_user)
+
     # Define the tools
-    tools = [query_database, get_weather, search_web]
+    tools = [query_database]
 
     # Create the prompt template with database context
     system_message = """You are a helpful AI assistant with access to a SQLite database containing user information.
@@ -297,7 +288,32 @@ def create_agent() -> AgentExecutor:
         handle_parsing_errors=True
     )
 
-    return agent_executor
+    def process_guardrail_result(guardrail_result: Dict[str, Any], original_input: str) -> str:
+        """Process the guardrail result and return appropriate response."""
+        if not guardrail_result["authorized"]:
+            return f"Access Denied: {guardrail_result['reason']}" + \
+                   (f"\nSensitive fields detected: {', '.join(guardrail_result['sensitive_fields'])}" 
+                    if guardrail_result["sensitive_fields"] else "")
+        
+        # If authorized and SQL query was generated, use it directly
+        if guardrail_result["sql_query"]:
+            sql_query = guardrail_result["sql_query"].format(current_user=current_user)
+            return query_database.invoke(sql_query)
+        
+        # If authorized but no SQL query, proceed with the agent
+        agent_response = agent_executor.invoke({
+            "input": original_input,
+            "chat_history": []
+        })
+        return agent_response["output"]
+
+    # Create the protected chain using proper piping
+    return (
+        RunnablePassthrough.assign(
+            guardrail_result=lambda x: guardrail_chain.invoke(x["input"])
+        )
+        | (lambda x: process_guardrail_result(x["guardrail_result"], x["input"]))
+    )
 
 def main():
     # Get a random user for this session
@@ -306,9 +322,8 @@ def main():
         print("Error: Could not get a user from the database. Please ensure the database is populated.")
         return
 
-    # Create the agent and guardrail chain
-    agent_executor = create_agent()
-    guardrail_chain = create_guardrail_chain(current_user)
+    # Create the protected agent chain
+    protected_agent = create_protected_agent(current_user)
     
     # Initialize chat history as a list of messages
     chat_history: List[Tuple[HumanMessage, AIMessage]] = []
@@ -327,38 +342,17 @@ def main():
             break
             
         try:
-            # First, run the guardrail check
-            guardrail_result = guardrail_chain.invoke(user_input)
-            
-            if not guardrail_result["authorized"]:
-                print(f"\nAccess Denied: {guardrail_result['reason']}")
-                if guardrail_result["sensitive_fields"]:
-                    print(f"Sensitive fields detected: {', '.join(guardrail_result['sensitive_fields'])}")
-                continue
-            
-            # If authorized, use the generated SQL query
-            if guardrail_result["sql_query"]:
-                # Replace the user ID placeholder with the actual ID
-                sql_query = guardrail_result["sql_query"].format(current_user=current_user)
-                # Use invoke instead of __call__ to avoid deprecation warning
-                response = query_database.invoke(sql_query)
-                print(f"\nAI: {response}")
-                continue
-            
-            # If no SQL query was generated, proceed with the agent
-            response = agent_executor.invoke({
-                "input": user_input,
-                "chat_history": [msg for pair in chat_history for msg in pair]
-            })
+            # Process the input through the protected agent chain
+            response_text = protected_agent.invoke({"input": user_input})
             
             # Get the AI's response
-            ai_message = AIMessage(content=response["output"])
+            ai_message = AIMessage(content=response_text)
             
             # Update chat history with the new exchange
             chat_history.append((HumanMessage(content=user_input), ai_message))
             
             # Print the response
-            print(f"\nAI: {ai_message.content}")
+            print(f"\nAI: {response_text}")
             
         except Exception as e:
             print(f"\nError: {str(e)}")
